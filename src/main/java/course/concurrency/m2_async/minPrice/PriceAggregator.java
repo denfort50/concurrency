@@ -4,9 +4,12 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.stream.Collectors;
 
+import static java.util.stream.Collectors.toList;
+
 public class PriceAggregator {
 
     private PriceRetriever priceRetriever = new PriceRetriever();
+    private final ExecutorService executor = Executors.newCachedThreadPool();
 
     public void setPriceRetriever(PriceRetriever priceRetriever) {
         this.priceRetriever = priceRetriever;
@@ -19,41 +22,22 @@ public class PriceAggregator {
     }
 
     public double getMinPrice(long itemId) {
-        ExecutorService executor = Executors.newFixedThreadPool(shopIds.size());
-        List<Callable<Double>> tasks = shopIds.stream()
-                .map(shopId -> (Callable<Double>) () -> {
-                    try {
-                        return priceRetriever.getPrice(itemId, shopId);
-                    } catch (Exception e) {
-                        return null;
-                    }
-                })
-                .collect(Collectors.toList());
+        List<CompletableFuture<Double>> completableFutureList =
+                shopIds.stream().map(shopId ->
+                                CompletableFuture.supplyAsync(() -> priceRetriever.getPrice(itemId, shopId), executor)
+                                        .completeOnTimeout(Double.POSITIVE_INFINITY, 2900, TimeUnit.MILLISECONDS)
+                                        .exceptionally(ex -> Double.POSITIVE_INFINITY))
+                        .toList();
 
-        List<Future<Double>> futures;
-        try {
-            futures = executor.invokeAll(tasks, 2750, TimeUnit.MILLISECONDS);
-        } catch (InterruptedException e) {
-            executor.shutdownNow();
-            return Double.NaN;
-        }
+        CompletableFuture
+                .allOf(completableFutureList.toArray(CompletableFuture[]::new))
+                .join();
 
-        executor.shutdownNow(); // важно завершить задачи
-
-        List<Double> prices = futures.stream()
-                .filter(Future::isDone) // задача завершилась (вовремя или нет)
-                .map(future -> {
-                    try {
-                        return future.get(); // если завершилась — get безопасен
-                    } catch (Exception e) {
-                        return null;
-                    }
-                })
-                .filter(Objects::nonNull)
-                .toList();
-
-        return prices.stream()
-                .min(Double::compareTo)
+        return completableFutureList
+                .stream()
+                .mapToDouble(CompletableFuture::join)
+                .filter(Double::isFinite)
+                .min()
                 .orElse(Double.NaN);
     }
 
